@@ -1,0 +1,13 @@
+[Unit]
+Description=pw-duck sidechain ducking
+After=pipewire-pulse.service
+Wants=pipewire-pulse.service
+
+[Service]
+# Edit the arguments to taste. See `pw-duck --help`.
+ExecStart=%h/.local/bin/pw-duck --output zoom --input zoom --target tidal-hifi
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

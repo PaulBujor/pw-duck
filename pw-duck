@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""pw-duck: sidechain ducking for PipeWire / PulseAudio.
+
+Lower the volume of one or more apps (--target) while something else is making
+sound: another app's playback (--output), a microphone being used by an app
+(--input), or a capture device (--input-device). A hold time keeps the duck
+engaged across short pauses, then the volume fades back up.
+
+  pw-duck --output zoom --input zoom --target tidal-hifi
+
+Find application names with `pw-duck --list`. Run `pw-duck --help` for options.
+Needs only Python 3.8+ and the `pactl` / `parec` tools (pipewire-pulse or pulseaudio).
+"""
+import argparse
+import array
+import json
+import math
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+RATE = 16000
+CHUNK_MS = 20
+CHUNK_BYTES = RATE * 2 * CHUNK_MS // 1000  # s16le mono
+TICK = 0.05                                # control-loop period, seconds
+SCAN_EVERY = 1.0                           # how often to re-read the stream graph
+
+
+def pactl_json(*args):
+    out = subprocess.run(["pactl", "-f", "json", *args],
+                         capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+def props(item):
+    return item.get("properties", {})
+
+
+def matches(item, query):
+    """Case-insensitive match on application.name (substring) or process binary (exact)."""
+    q = query.lower()
+    p = props(item)
+    return q in p.get("application.name", "").lower() or q == p.get("application.process.binary", "").lower()
+
+
+def peak_raw(item):
+    return max(v["value"] for v in item["volume"].values())
+
+
+class Level:
+    """Runs parec on one stream/device and records when it was last above threshold."""
+
+    def __init__(self, cmd, threshold_db):
+        self.threshold_db = threshold_db
+        self.last_active = 0.0
+        self.db = -120.0
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            data = self.proc.stdout.read(CHUNK_BYTES)
+            if len(data) < CHUNK_BYTES:
+                return
+            samples = array.array("h")
+            samples.frombytes(data)
+            # Remove DC offset first: some mics idle at a constant non-zero level that
+            # would otherwise read as permanent "sound".
+            mean = sum(samples) / len(samples)
+            rms = math.sqrt(sum((s - mean) ** 2 for s in samples) / len(samples)) / 32768
+            self.db = 20 * math.log10(rms) if rms > 0 else -120.0
+            if self.db > self.threshold_db:
+                self.last_active = time.monotonic()
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def stop(self):
+        if self.alive():
+            self.proc.terminate()
+
+
+def parec_cmd(device, monitor_stream=None):
+    cmd = ["parec", f"--device={device}", "--format=s16le", f"--rate={RATE}",
+           "--channels=1", f"--latency-msec={CHUNK_MS}"]
+    if monitor_stream is not None:
+        cmd.append(f"--monitor-stream={monitor_stream}")
+    return cmd
+
+
+def list_streams():
+    for title, kind in (("Playback streams (--output / --target)", "sink-inputs"),
+                        ("Capture streams (--input)", "source-outputs")):
+        print(title)
+        for i in pactl_json("list", kind):
+            p = props(i)
+            vol = f"{round(peak_raw(i) / 655.36)}%" if i.get("volume") else "?"
+            print(f"  #{i['index']:<6} name={p.get('application.name', '?')!r:<28} "
+                  f"binary={p.get('application.process.binary', '?')!r:<20} vol={vol}")
+    print("Capture devices (--input-device)")
+    for s in pactl_json("list", "sources"):
+        if not s["name"].endswith(".monitor"):
+            print(f"  {s['name']}  [{s['state']}]")
+
+
+def source_for_app(app, sources):
+    """Names of the capture sources an app is currently recording from."""
+    return [sources[o["source"]] for o in pactl_json("list", "source-outputs")
+            if matches(o, app) and o["source"] in sources]
+
+
+def calibrate(args):
+    """Sample the chosen input for N seconds and print level percentiles."""
+    sources = {s["index"]: s["name"] for s in pactl_json("list", "sources")}
+    devices = list(args.input_device)
+    for app in args.input:
+        devices += source_for_app(app, sources)
+    if not devices:
+        print("No input to measure: the --input app has no capture stream open, "
+              "or no --input-device given. See `pw-duck --list`.", file=sys.stderr)
+        return 1
+    dev = devices[0]
+    lvl = Level(parec_cmd(dev), 0.0)
+    time.sleep(0.3)
+    samples = []
+    end = time.monotonic() + args.calibrate
+    while time.monotonic() < end:
+        samples.append(lvl.db)
+        time.sleep(CHUNK_MS / 1000)
+    lvl.stop()
+    samples.sort()
+    pick = lambda p: samples[min(len(samples) - 1, int(p * len(samples)))]
+    print(f"source: {dev}\n{len(samples)} samples over {args.calibrate:g}s (dBFS RMS per {CHUNK_MS} ms)")
+    print("  ".join(f"p{int(p * 100)}={pick(p):6.1f}" for p in (0.05, 0.25, 0.5, 0.75, 0.9, 0.99))
+          + f"  max={samples[-1]:6.1f}")
+    return 0
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="pw-duck", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--target", action="append", default=[], metavar="APP",
+                    help="app to duck (repeatable). Matches application.name or process binary")
+    ap.add_argument("--output", action="append", default=[], metavar="APP",
+                    help="duck while APP's playback is audible (repeatable)")
+    ap.add_argument("--input", action="append", default=[], metavar="APP",
+                    help="duck while the mic APP is recording from is loud (repeatable)")
+    ap.add_argument("--input-device", action="append", default=[], metavar="SOURCE",
+                    help="duck while this capture device is loud, e.g. @DEFAULT_SOURCE@. Always opened, "
+                         "which can switch a Bluetooth headset to its headset profile")
+    ap.add_argument("--duck-db", type=float, default=-12.0, help="how far to duck, in dB (default -12)")
+    ap.add_argument("--output-threshold-db", type=float, default=-50.0,
+                    help="dBFS RMS that counts as playback sound (default -50)")
+    ap.add_argument("--input-threshold-db", type=float, default=-40.0,
+                    help="dBFS RMS that counts as you speaking (default -40; see --calibrate)")
+    ap.add_argument("--hold", type=float, default=1.5, help="seconds to stay ducked after sound stops (default 1.5)")
+    ap.add_argument("--attack", type=float, default=0.15, help="seconds to duck down (default 0.15)")
+    ap.add_argument("--release", type=float, default=1.0, help="seconds to fade back up (default 1.0)")
+    ap.add_argument("--calibrate", type=float, metavar="SECONDS",
+                    help="measure the first --input / --input-device for SECONDS, print level percentiles, exit")
+    ap.add_argument("--list", action="store_true", help="list playback/capture streams and capture devices, then exit")
+    ap.add_argument("--debug", action="store_true", help="print levels and gain twice a second")
+    return ap
+
+
+def main():
+    ap = build_parser()
+    args = ap.parse_args()
+
+    if args.list:
+        list_streams()
+        return 0
+    if args.calibrate:
+        return calibrate(args)
+    if not args.target:
+        ap.error("--target is required")
+    if not (args.output or args.input or args.input_device):
+        ap.error("give at least one of --output, --input, --input-device")
+
+    running = True
+
+    def stop(*_):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    watchers = {}      # key -> Level; key prefix says what it is: out: / in: / dev:
+    targets = {}       # sink-input index -> raw volume at 0 dB of ducking
+    gain_db = 0.0      # current ducking, 0 .. duck_db (shared by all targets)
+
+    def raw_for(base, gain):
+        # PulseAudio/PipeWire volumes are cubic: dB = 60 * log10(raw ratio).
+        return max(1, round(base * 10 ** (gain / 60)))
+
+    def apply_gain():
+        for idx, base in targets.items():
+            subprocess.run(["pactl", "set-sink-input-volume", str(idx), str(raw_for(base, gain_db))],
+                           stderr=subprocess.DEVNULL)
+
+    def scan():
+        inputs = pactl_json("list", "sink-inputs")
+        sinks = {s["index"]: s["name"] for s in pactl_json("list", "sinks")}
+        sources = {s["index"]: s["name"] for s in pactl_json("list", "sources")}
+
+        # Targets: track each matching stream's un-ducked volume.
+        seen = set()
+        for i in inputs:
+            if not any(matches(i, t) for t in args.target):
+                continue
+            idx, cur = i["index"], peak_raw(i)
+            seen.add(idx)
+            if idx not in targets:
+                targets[idx] = cur
+                if gain_db < 0:                       # appeared mid-duck
+                    apply_gain()
+            elif abs(cur - raw_for(targets[idx], gain_db)) > 0.02 * 65536:
+                targets[idx] = cur / 10 ** (gain_db / 60)   # user moved the slider: adopt it
+        for idx in list(targets):
+            if idx not in seen:
+                del targets[idx]
+
+        wanted = {}
+        for i in inputs:
+            if i["sink"] in sinks and any(matches(i, o) for o in args.output):
+                wanted[f"out:{i['index']}"] = (parec_cmd(sinks[i["sink"]] + ".monitor", i["index"]),
+                                               args.output_threshold_db)
+        # --input taps whichever source the app is actually capturing from, and only while
+        # it has a capture stream open (so we never wake a Bluetooth mic on our own).
+        for app in args.input:
+            for src in source_for_app(app, sources):
+                wanted[f"in:{src}"] = (parec_cmd(src), args.input_threshold_db)
+        for dev in args.input_device:
+            wanted[f"dev:{dev}"] = (parec_cmd(dev), args.input_threshold_db)
+
+        for key in list(watchers):
+            if key not in wanted or not watchers[key].alive():
+                watchers.pop(key).stop()
+        for key, (cmd, thr) in wanted.items():
+            if key not in watchers:
+                watchers[key] = Level(cmd, thr)
+
+    last_scan = last_debug = 0.0
+    try:
+        while running:
+            now = time.monotonic()
+            if now - last_scan >= SCAN_EVERY:
+                try:
+                    scan()
+                except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as e:
+                    print(f"pw-duck: scan failed ({e!r}); retrying", file=sys.stderr)
+                last_scan = now
+
+            active = any(now - w.last_active < args.hold for w in watchers.values())
+            goal = args.duck_db if active else 0.0
+            if targets and gain_db != goal:
+                secs = args.attack if goal < gain_db else args.release
+                delta = abs(args.duck_db) * TICK / max(secs, TICK)
+                gain_db = max(goal, gain_db - delta) if goal < gain_db else min(goal, gain_db + delta)
+                apply_gain()
+
+            if args.debug and now - last_debug >= 0.5:
+                levels = " ".join(f"{k}={w.db:6.1f}dB" for k, w in sorted(watchers.items())) or "(nothing to watch)"
+                print(f"{levels}  active={active}  gain={gain_db:6.1f}dB  targets={sorted(targets) or 'none'}",
+                      flush=True)
+                last_debug = now
+
+            time.sleep(TICK)
+    finally:
+        for w in watchers.values():
+            w.stop()
+        gain_db = 0.0
+        apply_gain()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
