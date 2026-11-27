@@ -74,6 +74,7 @@ pw-duck --input-device @DEFAULT_SOURCE@ --target spotify
 | `--hold` | `1.5` | Seconds to stay ducked after sound stops. Bridges pauses between words and sentences. |
 | `--attack` | `0.15` | Seconds to duck down. |
 | `--release` | `1.0` | Seconds to fade back up. |
+| `--easing` | `smooth` | Fade curve: `smooth` (smoothstep, gentle start and end) or `linear` (straight ramp in dB). |
 | `--output-threshold-db` | `-50` | Level (dBFS RMS) that counts as playback sound. |
 | `--input-threshold-db` | `-40` | Level (dBFS RMS) that counts as you speaking. |
 | `--calibrate SECONDS` | | Measure the first `--input` / `--input-device`, print percentiles, exit. |
@@ -99,7 +100,7 @@ Set `--input-threshold-db` between the quiet `max` and the talking `p25`. Use `-
 
 1. `pactl list sink-inputs / source-outputs` finds the streams by app name once a second, so apps that start, stop or recreate their streams are picked up.
 2. For each sidechain source, `parec --monitor-stream` taps that one stream (or `parec --device` taps a capture device) as 16 kHz mono PCM. Every 20 ms chunk gets an RMS level in dBFS, with the DC offset removed first because some laptop mics idle at a constant non-zero level that would otherwise look like permanent sound.
-3. If any source was above its threshold within the last `--hold` seconds, the duck is engaged. Gain ramps linearly in dB over `--attack` / `--release`.
+3. If any source was above its threshold within the last `--hold` seconds, the duck is engaged. Gain fades in dB over `--attack` / `--release` along the `--easing` curve, updated every 20 ms while fading. If the duck reverses mid-fade it eases from the current level, and the fade time scales with the distance left, so a short blip doesn't take a full attack or release.
 4. The gain is applied with `pactl set-sink-input-volume`. PulseAudio and PipeWire volumes are cubic (`dB = 60·log10(value)`), so `-12 dB` is applied as a factor of `10^(-12/60)` on the raw value and the dB drop is exact.
 5. On `SIGINT` / `SIGTERM` the original volumes are restored.
 

@@ -24,8 +24,14 @@ import time
 RATE = 16000
 CHUNK_MS = 20
 CHUNK_BYTES = RATE * 2 * CHUNK_MS // 1000  # s16le mono
-TICK = 0.05                                # control-loop period, seconds
+TICK = 0.05                                # control-loop period while idle, seconds
+RAMP_TICK = 0.02                           # control-loop period while fading (finer = smoother)
 SCAN_EVERY = 1.0                           # how often to re-read the stream graph
+
+EASINGS = {
+    "linear": lambda f: f,
+    "smooth": lambda f: f * f * (3 - 2 * f),   # smoothstep: gentle start and end
+}
 
 
 def pactl_json(*args):
@@ -158,6 +164,8 @@ def build_parser():
     ap.add_argument("--hold", type=float, default=1.5, help="seconds to stay ducked after sound stops (default 1.5)")
     ap.add_argument("--attack", type=float, default=0.15, help="seconds to duck down (default 0.15)")
     ap.add_argument("--release", type=float, default=1.0, help="seconds to fade back up (default 1.0)")
+    ap.add_argument("--easing", choices=sorted(EASINGS), default="smooth",
+                    help="fade curve (default smooth; linear is a straight ramp in dB)")
     ap.add_argument("--calibrate", type=float, metavar="SECONDS",
                     help="measure the first --input / --input-device for SECONDS, print level percentiles, exit")
     ap.add_argument("--list", action="store_true", help="list playback/capture streams and capture devices, then exit")
@@ -197,9 +205,11 @@ def main():
         return max(1, round(base * 10 ** (gain / 60)))
 
     def apply_gain():
-        for idx, base in targets.items():
-            subprocess.run(["pactl", "set-sink-input-volume", str(idx), str(raw_for(base, gain_db))],
-                           stderr=subprocess.DEVNULL)
+        # Launch all targets' updates together, then wait, so several targets fade in step.
+        procs = [subprocess.Popen(["pactl", "set-sink-input-volume", str(idx), str(raw_for(base, gain_db))],
+                                  stderr=subprocess.DEVNULL) for idx, base in targets.items()]
+        for p in procs:
+            p.wait()
 
     def scan():
         inputs = pactl_json("list", "sink-inputs")
@@ -243,6 +253,9 @@ def main():
             if key not in watchers:
                 watchers[key] = Level(cmd, thr)
 
+    ease = EASINGS[args.easing]
+    ramp = None            # (start_time, duration, from_db, to_db) while fading
+    ramp_goal = 0.0        # the goal the current ramp (or rest state) is heading to
     last_scan = last_debug = 0.0
     try:
         while running:
@@ -256,11 +269,21 @@ def main():
 
             active = any(now - w.last_active < args.hold for w in watchers.values())
             goal = args.duck_db if active else 0.0
-            if targets and gain_db != goal:
+            if goal != ramp_goal:
+                # New direction (or first duck): ease from the current gain. Duration scales with
+                # the distance left, so a reversal mid-fade doesn't take a full attack/release.
+                ramp_goal = goal
                 secs = args.attack if goal < gain_db else args.release
-                delta = abs(args.duck_db) * TICK / max(secs, TICK)
-                gain_db = max(goal, gain_db - delta) if goal < gain_db else min(goal, gain_db + delta)
-                apply_gain()
+                dur = secs * abs(goal - gain_db) / max(abs(args.duck_db), 1e-9)
+                ramp = (now, dur, gain_db, goal)
+            if ramp:
+                t0, dur, g0, g1 = ramp
+                f = 1.0 if dur <= 0 else min(1.0, (now - t0) / dur)
+                gain_db = g0 + (g1 - g0) * ease(f)
+                if targets:
+                    apply_gain()
+                if f >= 1.0:
+                    ramp = None
 
             if args.debug and now - last_debug >= 0.5:
                 levels = " ".join(f"{k}={w.db:6.1f}dB" for k, w in sorted(watchers.items())) or "(nothing to watch)"
@@ -268,7 +291,7 @@ def main():
                       flush=True)
                 last_debug = now
 
-            time.sleep(TICK)
+            time.sleep(RAMP_TICK if ramp else TICK)
     finally:
         for w in watchers.values():
             w.stop()
