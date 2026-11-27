@@ -58,7 +58,7 @@ def default_config_path():
 
 DEFAULTS = {
     "target": [], "output": [], "input": [], "input_device": [],
-    "duck_db": -12.0, "output_threshold_db": -50.0, "input_threshold_db": -40.0,
+    "duck_db": -20.0, "output_threshold_db": -50.0, "input_threshold_db": -40.0,
     "input_sustain_ms": 100.0, "hold": 1.5, "attack": 0.15, "release": 1.0, "easing": "smooth",
     "config": default_config_path(), "calibrate": None, "calibrate_guided": False,
     "calibrate_seconds": 10.0, "no_save": False, "save_config": False,
@@ -362,7 +362,7 @@ def build_parser():
     ap.add_argument("--input-device", action="append", metavar="SOURCE",
                     help="duck while this capture device is loud, e.g. @DEFAULT_SOURCE@. Always opened, "
                          "which can switch a Bluetooth headset to its headset profile")
-    ap.add_argument("--duck-db", type=float, help="how far to duck, in dB (default -12)")
+    ap.add_argument("--duck-db", type=float, help="how far to duck, in dB (default -20)")
     ap.add_argument("--output-threshold-db", type=float,
                     help="dBFS RMS that counts as playback sound (default -50)")
     ap.add_argument("--input-threshold-db", type=float,
