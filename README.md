@@ -78,7 +78,7 @@ input = zoom
 input-threshold-db = -41.8
 ```
 
-Keys are the long option names without `--`; list options (`target`, `output`, `input`, `input-device`) are comma-separated. A list given on the command line replaces the file's list, it doesn't add to it. A file with a typo is ignored with a message in the log, and the previous settings stay in effect.
+Keys are the long option names without `--`; list options (`target`, `output`, `input`, `input-device`) are comma-separated, so a name can't contain a comma. A list given on the command line replaces the file's list, it doesn't add to it. A file with an invalid value is ignored with a message in the log, and the previous settings stay in effect. Comments are not preserved when `pw-duck` rewrites the file (`--save-config`, `--calibrate-guided`).
 
 ```sh
 # write the settings you pass on the command line into the config, then exit
@@ -151,7 +151,18 @@ A laptop mic hears typing almost as loud as speech, so a plain level threshold c
 2. For each sidechain source, `parec --monitor-stream` taps that one stream (or `parec --device` taps a capture device) as 16 kHz mono PCM. Every 20 ms chunk gets an RMS level in dBFS, with the DC offset removed first because some laptop mics idle at a constant non-zero level that would otherwise look like permanent sound.
 3. If any source was above its threshold within the last `--hold` seconds, the duck is engaged. Gain fades in dB over `--attack` / `--release` along the `--easing` curve, updated every 20 ms while fading. If the duck reverses mid-fade it eases from the current level, and the fade time scales with the distance left, so a short blip doesn't take a full attack or release.
 4. The gain is applied with `pactl set-sink-input-volume`. PulseAudio and PipeWire volumes are cubic (`dB = 60·log10(value)`), so a duck of `-20 dB` is applied as a factor of `10^(-20/60)` on the raw value and the dB drop is exact.
-5. On `SIGINT` / `SIGTERM` the original volumes are restored.
+5. On `SIGINT` / `SIGTERM` the original volumes are restored. While a duck is engaged, the original volumes are also kept in `$XDG_RUNTIME_DIR/pw-duck-state.json` (mode 0600), so if `pw-duck` is killed outright (`SIGKILL`, out of memory, power loss) the next start puts them back instead of mistaking the ducked volume for yours. The file is removed once volumes are restored.
+
+## Security and privacy
+
+- **Microphone.** With `--input` or `--input-device`, `pw-duck` reads the mic through `parec`, but only to compute a loudness number for each 20 ms. The audio is discarded immediately: it is never written to disk, logged or sent anywhere, and the tool contains no network code. `--debug` prints those loudness numbers and source names (so it shows when you are speaking) to the terminal or journal; it is off by default.
+- **Privileges.** It runs as your user, needs no root, and only executes `pactl`, `parec` and (for calibration cues) `notify-send` / `paplay`. Every command is built as an argument list and never goes through a shell, so app and device names can't inject commands or options.
+- **Settings are validated** wherever they come from (config file or command line). `duck-db` can't be positive, since that would *raise* a stream's volume; numbers must be finite and inside sane ranges (for example `hold` 0 to 3600 s). A bad edit to the config of a running service is logged and ignored, and the previous settings stay in effect.
+- **Config writes are safe.** The file is replaced atomically via a private temporary file, so a planted symlink isn't followed. A symlinked config stays a symlink, and an unreadable or malformed config is reported rather than overwritten.
+- **Volumes never go above where they were.** While ducked, a stray volume change by another program can't push a stream above 100% (or the highest volume it had).
+- **App names are self-reported.** The sound server takes `application.name` from the apps themselves, so any program in your session can name its stream to match your `--output` / `--input` / `--target` settings, for example to keep your music ducked, or to make `pw-duck` tap a microphone it is recording from. It can't gain anything it couldn't already do by running `pactl` and `parec` itself. `pw-duck`'s own `parec` streams are never matched, and an empty name matches nothing.
+
+Found a problem? Please open an issue on the repository.
 
 ## Run it in the background
 

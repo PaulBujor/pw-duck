@@ -19,6 +19,7 @@ import argparse
 import array
 import collections
 import configparser
+import io
 import json
 import math
 import os
@@ -26,6 +27,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -35,6 +37,8 @@ CHUNK_BYTES = RATE * 2 * CHUNK_MS // 1000  # s16le mono
 TICK = 0.05                                # control-loop period while idle, seconds
 RAMP_TICK = 0.02                           # control-loop period while fading (finer = smoother)
 SCAN_EVERY = 1.0                           # how often to re-read the stream graph and the config
+PACTL_TIMEOUT = 5.0                        # seconds before a hung pactl is given up on
+MAX_RESTORE_RAW = 98304                    # 150%: never restore a recorded volume above this
 
 EASINGS = {
     "linear": lambda f: f,
@@ -74,13 +78,23 @@ def dest_of(key):
     return key.replace("-", "_")
 
 
-def read_config(path):
-    """Return {dest: value} from the config file; {} if it doesn't exist."""
+def load_ini(path):
+    """Parse the INI file at path. A missing file is an empty config; an unreadable or
+    malformed one is an error (never silently treated as empty, so it can't be overwritten)."""
     cp = configparser.ConfigParser(interpolation=None)
     try:
-        cp.read(path)
-    except configparser.Error as e:
+        with open(path, encoding="utf-8") as f:
+            cp.read_file(f)
+    except FileNotFoundError:
+        pass
+    except (OSError, UnicodeError, configparser.Error) as e:
         raise ConfigError(f"{path}: {e}")
+    return cp
+
+
+def read_config(path):
+    """Return {dest: value} from the config file; {} if it doesn't exist."""
+    cp = load_ini(path)
     out = {}
     if not cp.has_section(CONFIG_SECTION):
         return out
@@ -93,25 +107,56 @@ def read_config(path):
             out[dest_of(key)] = ([x.strip() for x in raw.split(",") if x.strip()] if typ is list else typ(raw))
         except ValueError:
             raise ConfigError(f"{path}: bad value for '{key}': {raw!r}")
-    if out.get("easing", "smooth") not in EASINGS:
-        raise ConfigError(f"{path}: easing must be one of {sorted(EASINGS)}")
     return out
 
 
+def write_atomic(path, text, mode=0o644):
+    """Write text to path via a fresh, exclusively-created temp file in the same directory, then
+    rename over it. Never follows a pre-planted symlink or leaves a half-written file."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".pw-duck-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+CONFIG_HEADER = ("# pw-duck settings. Written by `pw-duck --save-config` / `--calibrate-guided`.\n"
+                 "# Safe to edit; comments are not preserved when pw-duck rewrites this file.\n")
+
+
 def save_config(path, updates):
-    """Merge {key: value} into the config file (keeps other settings), atomically."""
-    cp = configparser.ConfigParser(interpolation=None)
-    cp.read(path)
+    """Merge {key: value} into the config file, keeping its other settings."""
+    path = os.path.realpath(path)          # a symlinked config (dotfile managers) stays a symlink
+    cp = load_ini(path)
     if not cp.has_section(CONFIG_SECTION):
         cp.add_section(CONFIG_SECTION)
     for key, value in updates.items():
-        cp[CONFIG_SECTION][key] = ", ".join(value) if isinstance(value, list) else f"{value:g}" if isinstance(value, float) else str(value)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        f.write("# pw-duck settings. Written by `pw-duck --save-config` / `--calibrate-guided`; safe to edit.\n")
-        cp.write(f)
-    os.replace(tmp, path)
+        if isinstance(value, list):
+            if any("," in x or "\n" in x for x in value):
+                raise ConfigError(f"{key}: names containing a comma or newline can't be stored in the config file")
+            cp[CONFIG_SECTION][key] = ", ".join(value)
+        else:
+            cp[CONFIG_SECTION][key] = f"{value:g}" if isinstance(value, float) else str(value)
+    out = io.StringIO()
+    out.write(CONFIG_HEADER)
+    cp.write(out)
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except OSError:
+        mode = 0o644
+    try:
+        write_atomic(path, out.getvalue(), mode)
+    except OSError as e:
+        raise ConfigError(f"{path}: {e}")
 
 
 def config_updates_from_cli(cli, keys=None):
@@ -119,11 +164,43 @@ def config_updates_from_cli(cli, keys=None):
     return {k: cli[dest_of(k)] for k in CONFIG_KEYS if dest_of(k) in cli and (keys is None or k in keys)}
 
 
+# Allowed (min, max) for each numeric setting. NaN, inf and anything outside are rejected.
+LIMITS = {
+    "duck_db": (-120.0, 0.0),              # never positive: that would RAISE the target's volume
+    "output_threshold_db": (-120.0, 0.0),
+    "input_threshold_db": (-120.0, 0.0),
+    "input_sustain_ms": (0.0, 5000.0),
+    "hold": (0.0, 3600.0),
+    "attack": (0.0, 600.0),
+    "release": (0.0, 600.0),
+    "calibrate_seconds": (1.0, 600.0),
+}
+
+
+def validate(values):
+    """Reject settings that could misbehave (from the config file or the command line)."""
+    for dest, (lo, hi) in LIMITS.items():
+        v = values[dest]
+        if not (math.isfinite(v) and lo <= v <= hi):
+            raise ConfigError(f"{dest.replace('_', '-')} must be a number from {lo:g} to {hi:g}, got {v!r}")
+    cal = values.get("calibrate")
+    if cal is not None and not (math.isfinite(cal) and 1.0 <= cal <= 600.0):
+        raise ConfigError(f"calibrate must be a number of seconds from 1 to 600, got {cal!r}")
+    if values["easing"] not in EASINGS:
+        raise ConfigError(f"easing must be one of {sorted(EASINGS)}, got {values['easing']!r}")
+    for key in ("target", "output", "input", "input_device"):
+        names = [x.strip() for x in values[key]]
+        if not all(names):
+            raise ConfigError(f"{key.replace('_', '-')}: empty name")
+        values[key] = names
+
+
 def resolve(cli):
-    """Defaults < config file < command line."""
+    """Defaults < config file < command line, validated."""
     values = dict(DEFAULTS)
     values.update(read_config(cli.get("config", DEFAULTS["config"])))
     values.update(cli)
+    validate(values)
     return argparse.Namespace(**values)
 
 
@@ -135,9 +212,12 @@ def file_mtime(path):
 
 
 def pactl_json(*args):
-    out = subprocess.run(["pactl", "-f", "json", *args],
-                         capture_output=True, text=True, check=True).stdout
-    return json.loads(out)
+    out = subprocess.run(["pactl", "-f", "json", *args], capture_output=True, text=True,
+                         check=True, timeout=PACTL_TIMEOUT).stdout
+    data = json.loads(out)
+    if not isinstance(data, list):
+        raise ValueError(f"unexpected pactl output for {' '.join(args)}")
+    return data
 
 
 def props(item):
@@ -145,9 +225,12 @@ def props(item):
 
 
 def matches(item, query):
-    """Case-insensitive match on application.name (substring) or process binary (exact)."""
-    q = query.lower()
+    """Case-insensitive match on application.name (substring) or process binary (exact).
+    An empty query matches nothing, and pw-duck's own parec taps are never matched."""
+    q = query.strip().lower()
     p = props(item)
+    if not q or p.get("application.process.binary") == "parec":
+        return False
     return q in p.get("application.name", "").lower() or q == p.get("application.process.binary", "").lower()
 
 
@@ -164,7 +247,7 @@ class Level:
 
     def __init__(self, cmd, threshold_db, sustain_chunks=1, record=False):
         self.threshold_db = threshold_db
-        self.last_active = 0.0
+        self.last_active = -math.inf          # "never": monotonic() is time since boot, not since 0
         self.db = -120.0
         self.sustained_db = -120.0
         self._recent = collections.deque(maxlen=max(1, sustain_chunks))
@@ -276,6 +359,9 @@ def calibrate(args):
     if dev is None:
         return 1
     trace = measure(dev, args.calibrate, sustain_chunks_for(args))
+    if not trace:
+        print(f"pw-duck: no audio captured from {dev} (is parec working?)", file=sys.stderr)
+        return 1
     print(f"source: {dev}\n{len(trace)} chunks over {args.calibrate:g}s (dBFS RMS per {CHUNK_MS} ms)")
     print(f"  instant:   {percentile_line([t[0] for t in trace])}")
     print(f"  sustained: {percentile_line([t[1] for t in trace])}   (held for {args.input_sustain_ms:g} ms)")
@@ -306,6 +392,9 @@ def calibrate_guided(args, cli):
     noise = measure(dev, secs, n)
     cue("PHASE 2: talk normally, as you would on the call")
     speech = measure(dev, secs, n)
+    if not noise or not speech:
+        print(f"pw-duck: no audio captured from {dev} (is parec working?); nothing saved", file=sys.stderr)
+        return 1
     if shutil.which("notify-send"):
         subprocess.run(["notify-send", "-t", "3000", "pw-duck calibration", "Done"], stderr=subprocess.DEVNULL)
 
@@ -401,9 +490,6 @@ def main(argv=None):
         print(f"pw-duck: {e}", file=sys.stderr)
         return 2
 
-    if args.list:
-        list_streams()
-        return 0
     if args.show_config:
         show_config(args, cli)
         return 0
@@ -411,12 +497,29 @@ def main(argv=None):
         updates = config_updates_from_cli(cli)
         if not updates:
             ap.error("--save-config needs at least one setting on the command line")
-        save_config(args.config, updates)
+        try:
+            save_config(args.config, updates)
+        except ConfigError as e:
+            print(f"pw-duck: {e}", file=sys.stderr)
+            return 2
         print(f"saved {', '.join(updates)} to {args.config}")
         return 0
+
+    missing = [tool for tool in ("pactl", "parec") if not shutil.which(tool)]
+    if missing:
+        print(f"pw-duck: required tool(s) not found in PATH: {', '.join(missing)} "
+              "(install pulseaudio-utils / libpulse)", file=sys.stderr)
+        return 127
+    if args.list:
+        list_streams()
+        return 0
     if args.calibrate_guided:
-        return calibrate_guided(args, cli)
-    if args.calibrate:
+        try:
+            return calibrate_guided(args, cli)
+        except ConfigError as e:
+            print(f"pw-duck: {e}", file=sys.stderr)
+            return 2
+    if args.calibrate is not None:
         return calibrate(args)
     if not args.target:
         ap.error(f"no target: pass --target APP or set `target` in {args.config}")
@@ -442,15 +545,87 @@ def main(argv=None):
         # PulseAudio/PipeWire volumes are cubic: dB = 60 * log10(raw ratio).
         return max(1, round(base * 10 ** (gain / 60)))
 
+    last_logged = {}
+
+    def warn(msg, every=10.0):
+        """Log a problem, at most once per `every` seconds per message (the loop can run at 50 Hz)."""
+        t = time.monotonic()
+        if t - last_logged.get(msg, -math.inf) >= every:
+            last_logged[msg] = t
+            print(f"pw-duck: {msg}", file=sys.stderr, flush=True)
+
     def set_volumes(items):
+        """Set raw volumes for (sink-input index, raw) pairs. Returns False if any update failed."""
         # Launch all updates together, then wait, so several targets fade in step.
-        procs = [subprocess.Popen(["pactl", "set-sink-input-volume", str(idx), str(raw)],
-                                  stderr=subprocess.DEVNULL) for idx, raw in items]
+        procs, ok = [], True
+        for idx, raw in items:
+            try:
+                procs.append(subprocess.Popen(["pactl", "set-sink-input-volume", str(idx), str(raw)],
+                                              stderr=subprocess.DEVNULL))
+            except OSError as e:
+                warn(f"cannot run pactl: {e}")
+                ok = False
         for p in procs:
-            p.wait()
+            try:
+                p.wait(timeout=PACTL_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                warn("pactl timed out setting a volume")
+                ok = False
+        return ok
 
     def apply_gain():
-        set_volumes([(idx, raw_for(base, gain_db)) for idx, base in targets.items()])
+        return set_volumes([(idx, raw_for(base, gain_db)) for idx, base in targets.items()])
+
+    # --- crash recovery: remember un-ducked volumes while ducked, so that if we are killed
+    # (SIGKILL, OOM, power loss) mid-duck, the next start can put them back instead of
+    # mistaking the ducked volume for the user's own.
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    state_file = os.path.join(runtime_dir, "pw-duck-state.json") if runtime_dir else None
+    target_names = {}      # sink-input index -> application.name
+
+    written = {"data": None}       # last state written, so unchanged state isn't rewritten every tick
+
+    def save_state():
+        if not state_file:
+            return
+        data = {str(i): {"base": round(b), "name": target_names.get(i, "")} for i, b in targets.items()}
+        if data == written["data"]:
+            return
+        try:
+            write_atomic(state_file, json.dumps(data), 0o600)
+            written["data"] = data
+        except OSError as e:
+            warn(f"cannot write state file: {e}")
+
+    def clear_state():
+        written["data"] = None
+        if state_file:
+            try:
+                os.unlink(state_file)
+            except OSError:
+                pass
+
+    def recover_state():
+        if not (state_file and os.path.exists(state_file)):
+            return
+        try:
+            with open(state_file, encoding="utf-8") as f:
+                saved = json.load(f)
+            live = {i["index"]: i for i in pactl_json("list", "sink-inputs")}
+            items = []
+            for idx, rec in saved.items():
+                stream = live.get(int(idx))
+                base = min(int(rec["base"]), MAX_RESTORE_RAW)
+                if (stream and stream.get("volume") and base >= 1
+                        and props(stream).get("application.name") == rec["name"] and peak_raw(stream) < base):
+                    items.append((int(idx), base))
+            if items and set_volumes(items):
+                print(f"pw-duck: restored {len(items)} stream(s) left ducked by an unclean exit",
+                      file=sys.stderr, flush=True)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError):
+            pass                              # unusable state: ignore it
+        clear_state()
 
     def reload_config():
         nonlocal args, ease, cfg_mtime
@@ -479,16 +654,21 @@ def main(argv=None):
         # Targets: track each matching stream's un-ducked volume.
         seen = set()
         for i in inputs:
-            if not any(matches(i, t) for t in args.target):
+            if not i.get("volume") or not any(matches(i, t) for t in args.target):
                 continue
             idx, cur = i["index"], peak_raw(i)
             seen.add(idx)
+            target_names[idx] = props(i).get("application.name", "")
             if idx not in targets:
                 targets[idx] = cur
                 if gain_db < 0:                       # appeared mid-duck
                     apply_gain()
             elif abs(cur - raw_for(targets[idx], gain_db)) > 0.02 * 65536:
-                targets[idx] = cur / 10 ** (gain_db / 60)   # user moved the slider: adopt it
+                # Someone changed the volume (the user, or the app resetting it). Adopt it as the new
+                # level. While ducked, the new baseline is capped at 100% (or the highest volume seen
+                # before), so a stray write can't ratchet the stream up past what the user had.
+                adopted = cur / 10 ** (gain_db / 60)
+                targets[idx] = min(adopted, max(targets[idx], 65536)) if gain_db < 0 else adopted
         existing = {i["index"] for i in inputs}
         for idx in list(targets):
             if idx not in seen:
@@ -515,8 +695,12 @@ def main(argv=None):
         for key, (cmd, thr, sustain_n) in wanted.items():
             if key not in watchers:
                 watchers[key] = Level(cmd, thr, sustain_n)
+        if gain_db < 0:
+            save_state()                              # baselines may have changed mid-duck
 
-    ramp = None            # (start_time, duration, from_db, to_db) while fading
+    scan_errors = (subprocess.SubprocessError, json.JSONDecodeError, KeyError, ValueError, TypeError, OSError)
+    recover_state()
+    ramp = None           # (start_time, duration, from_db, to_db) while fading
     ramp_goal = 0.0        # the goal the current ramp (or rest state) is heading to
     last_scan = last_debug = 0.0
     try:
@@ -525,8 +709,8 @@ def main(argv=None):
             if now - last_scan >= SCAN_EVERY:
                 try:
                     scan()
-                except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as e:
-                    print(f"pw-duck: scan failed ({e!r}); retrying", file=sys.stderr, flush=True)
+                except scan_errors as e:
+                    warn(f"scan failed ({type(e).__name__}: {e}); retrying")
                 last_scan = now
 
             active = any(now - w.last_active < args.hold for w in watchers.values())
@@ -543,9 +727,13 @@ def main(argv=None):
                 f = 1.0 if dur <= 0 else min(1.0, (now - t0) / dur)
                 gain_db = g0 + (g1 - g0) * ease(f)
                 if targets:
+                    if gain_db < 0:
+                        save_state()                  # before the volume moves, in case we die mid-duck
                     apply_gain()
                 if f >= 1.0:
                     ramp = None
+                    if goal == 0.0:
+                        clear_state()
 
             if args.debug and now - last_debug >= 0.5:
                 levels = " ".join(f"{k}={w.db:6.1f}/{w.sustained_db:6.1f}dB" for k, w in sorted(watchers.items())) \
@@ -559,7 +747,8 @@ def main(argv=None):
         for w in watchers.values():
             w.stop()
         gain_db = 0.0
-        apply_gain()
+        if apply_gain():
+            clear_state()
     return 0
 
 
