@@ -77,24 +77,39 @@ pw-duck --input-device @DEFAULT_SOURCE@ --target spotify
 | `--easing` | `smooth` | Fade curve: `smooth` (smoothstep, gentle start and end) or `linear` (straight ramp in dB). |
 | `--output-threshold-db` | `-50` | Level (dBFS RMS) that counts as playback sound. |
 | `--input-threshold-db` | `-40` | Level (dBFS RMS) that counts as you speaking. |
+| `--input-sustain-ms` | `100` | The input must stay above its threshold this long to count. Ignores keystroke clicks. |
+| `--calibrate-guided` | | Guided two-phase calibration (noise, then speech) with suggested settings. |
+| `--calibrate-seconds` | `10` | Length of each guided phase. |
 | `--calibrate SECONDS` | | Measure the first `--input` / `--input-device`, print percentiles, exit. |
 | `--debug` | | Print levels and gain twice a second. |
 
 ## Calibrating the mic threshold
 
-Playback from an app is usually digital silence between sounds, so the `-50` dB default is fine. A microphone has a noise floor, so pick its threshold from your own room:
+Playback from an app is usually digital silence between sounds, so the `-50` dB default is fine. A microphone has a noise floor and, on a laptop, picks up your own typing, so pick its settings from your own room. Join the call first so the app has a capture stream, then:
 
 ```sh
-# join the call first so the app has a capture stream, then stay quiet:
-pw-duck --input zoom --calibrate 6
-# source: alsa_input.pci-0000_00_1f.3.analog-stereo
-# p5= -63.0  p25= -61.1  p50= -59.2  p75= -57.4  p90= -55.6  p99= -51.8  max= -49.0
-
-# now talk normally:
-pw-duck --input zoom --calibrate 6
+pw-duck --input zoom --calibrate-guided
 ```
 
-Set `--input-threshold-db` between the quiet `max` and the talking `p25`. Use `--debug` to watch the live levels while you tune it.
+It runs two phases of 10 seconds (`--calibrate-seconds`), announced by a notification and a sound: first your normal background noise (type, but don't talk), then talking. It prints the level percentiles of each phase and suggests settings:
+
+```
+sustained level (dBFS RMS):
+  noise:  p5= -63.2  p25= -54.1  p50= -51.7  p75= -48.3  p90= -46.6  p99= -44.3  max= -43.0
+  speech: p5= -62.3  p25= -54.9  p50= -47.5  p75= -42.4  p90= -38.0  p99= -34.4  max= -31.8
+
+suggested: --input-threshold-db -41.8 --input-sustain-ms 100
+  background noise above it: 0.0% of chunks
+  speech above it:           23.2% of chunks (--hold 1.5s bridges the gaps between words)
+```
+
+The "speech above it" figure is per 20 ms chunk. Speech is full of short gaps, and `--hold` keeps the duck engaged across them, so it doesn't need to be near 100%. The tool warns if almost none of your speech clears the noise.
+
+For a quick single measurement, `--calibrate SECONDS` prints both the instantaneous and the sustained percentiles. Use `--debug` to watch live levels (`instant/sustained`) while you tune.
+
+### Ignoring keystrokes and other clicks
+
+A laptop mic hears typing almost as loud as speech, so a plain level threshold can't tell them apart. They differ in duration: a keystroke is a click of a few milliseconds, speech is sustained. `--input-sustain-ms` (default 100) requires the level to stay above the threshold for that long, which drops the clicks. In the example above, typing peaks at -26 dB instantaneously but only -43 dB once sustained. Raise it if typing still triggers the duck, lower it if the duck reacts too slowly to the start of speech.
 
 ## How it works
 

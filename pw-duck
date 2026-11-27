@@ -13,8 +13,11 @@ Needs only Python 3.8+ and the `pactl` / `parec` tools (pipewire-pulse or pulsea
 """
 import argparse
 import array
+import collections
 import json
 import math
+import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -56,12 +59,19 @@ def peak_raw(item):
 
 
 class Level:
-    """Runs parec on one stream/device and records when it was last above threshold."""
+    """Runs parec on one stream/device and records when it was last above threshold.
 
-    def __init__(self, cmd, threshold_db):
+    `sustained_db` is the lowest chunk level over the last `sustain_chunks` chunks, i.e. the
+    level that was held for the whole window. Short clicks (keystrokes) don't survive it.
+    """
+
+    def __init__(self, cmd, threshold_db, sustain_chunks=1, record=False):
         self.threshold_db = threshold_db
         self.last_active = 0.0
         self.db = -120.0
+        self.sustained_db = -120.0
+        self._recent = collections.deque(maxlen=max(1, sustain_chunks))
+        self.trace = [] if record else None       # [(db, sustained_db)] per chunk
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -77,7 +87,12 @@ class Level:
             mean = sum(samples) / len(samples)
             rms = math.sqrt(sum((s - mean) ** 2 for s in samples) / len(samples)) / 32768
             self.db = 20 * math.log10(rms) if rms > 0 else -120.0
-            if self.db > self.threshold_db:
+            self._recent.append(self.db)
+            full = len(self._recent) == self._recent.maxlen
+            self.sustained_db = min(self._recent) if full else -120.0
+            if self.trace is not None:
+                self.trace.append((self.db, self.sustained_db))
+            if self.sustained_db > self.threshold_db:
                 self.last_active = time.monotonic()
 
     def alive(self):
@@ -117,8 +132,8 @@ def source_for_app(app, sources):
             if matches(o, app) and o["source"] in sources]
 
 
-def calibrate(args):
-    """Sample the chosen input for N seconds and print level percentiles."""
+def input_device(args):
+    """First capture device to measure: an --input-device, else an --input app's source."""
     sources = {s["index"]: s["name"] for s in pactl_json("list", "sources")}
     devices = list(args.input_device)
     for app in args.input:
@@ -126,21 +141,91 @@ def calibrate(args):
     if not devices:
         print("No input to measure: the --input app has no capture stream open, "
               "or no --input-device given. See `pw-duck --list`.", file=sys.stderr)
-        return 1
-    dev = devices[0]
-    lvl = Level(parec_cmd(dev), 0.0)
+    return devices[0] if devices else None
+
+
+def sustain_chunks_for(args):
+    return max(1, round(args.input_sustain_ms / CHUNK_MS))
+
+
+def measure(device, seconds, sustain_chunks):
+    """Record per-chunk levels for `seconds`; returns [(db, sustained_db)]."""
+    lvl = Level(parec_cmd(device), 0.0, sustain_chunks, record=True)
     time.sleep(0.3)
-    samples = []
-    end = time.monotonic() + args.calibrate
-    while time.monotonic() < end:
-        samples.append(lvl.db)
-        time.sleep(CHUNK_MS / 1000)
+    lvl.trace.clear()                      # drop start-up chunks
+    time.sleep(seconds)
     lvl.stop()
-    samples.sort()
-    pick = lambda p: samples[min(len(samples) - 1, int(p * len(samples)))]
-    print(f"source: {dev}\n{len(samples)} samples over {args.calibrate:g}s (dBFS RMS per {CHUNK_MS} ms)")
-    print("  ".join(f"p{int(p * 100)}={pick(p):6.1f}" for p in (0.05, 0.25, 0.5, 0.75, 0.9, 0.99))
-          + f"  max={samples[-1]:6.1f}")
+    time.sleep(0.1)
+    return list(lvl.trace)
+
+
+def pick(sorted_vals, p):
+    return sorted_vals[min(len(sorted_vals) - 1, int(p * len(sorted_vals)))]
+
+
+def percentile_line(values):
+    v = sorted(values)
+    return "  ".join(f"p{int(p * 100)}={pick(v, p):6.1f}" for p in (0.05, 0.25, 0.5, 0.75, 0.9, 0.99)) + f"  max={v[-1]:6.1f}"
+
+
+def frac_above(values, threshold):
+    return sum(1 for x in values if x > threshold) / len(values)
+
+
+def calibrate(args):
+    """Measure the input for N seconds and print instantaneous and sustained level percentiles."""
+    dev = input_device(args)
+    if dev is None:
+        return 1
+    trace = measure(dev, args.calibrate, sustain_chunks_for(args))
+    print(f"source: {dev}\n{len(trace)} chunks over {args.calibrate:g}s (dBFS RMS per {CHUNK_MS} ms)")
+    print(f"  instant:   {percentile_line([t[0] for t in trace])}")
+    print(f"  sustained: {percentile_line([t[1] for t in trace])}   (held for {args.input_sustain_ms:g} ms)")
+    return 0
+
+
+def cue(message, lead=3.0):
+    """Tell the user what to do next: terminal line, desktop notification, and a sound."""
+    print(f"\n>>> {message} (starts in {lead:g}s)", flush=True)
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-u", "critical", "-t", str(int(lead * 1000)), "pw-duck calibration",
+                        f"{message} (starts in {lead:g}s)"], stderr=subprocess.DEVNULL)
+    time.sleep(lead)
+    bell = "/usr/share/sounds/freedesktop/stereo/message.oga"
+    if shutil.which("paplay") and os.path.exists(bell):
+        subprocess.run(["paplay", bell], stderr=subprocess.DEVNULL)
+
+
+def calibrate_guided(args):
+    """Two measured phases (noise you want ignored, then speech) and a suggested threshold."""
+    dev = input_device(args)
+    if dev is None:
+        return 1
+    n = sustain_chunks_for(args)
+    secs = args.calibrate_seconds
+    print(f"source: {dev}  |  sustain window {args.input_sustain_ms:g} ms  |  {secs:g}s per phase")
+    cue("PHASE 1: do your normal background noise, e.g. type, but do NOT talk")
+    noise = measure(dev, secs, n)
+    cue("PHASE 2: talk normally, as you would on the call")
+    speech = measure(dev, secs, n)
+    notify = shutil.which("notify-send")
+    if notify:
+        subprocess.run([notify, "-t", "3000", "pw-duck calibration", "Done"], stderr=subprocess.DEVNULL)
+
+    print("\nsustained level (dBFS RMS):")
+    print(f"  noise:  {percentile_line([t[1] for t in noise])}")
+    print(f"  speech: {percentile_line([t[1] for t in speech])}")
+    noise_s = sorted(t[1] for t in noise)
+    speech_s = [t[1] for t in speech]
+    threshold = round(pick(noise_s, 0.995) + 1.5, 1)
+    noise_hit, speech_hit = frac_above(noise_s, threshold), frac_above(speech_s, threshold)
+    print(f"\nsuggested: --input-threshold-db {threshold:g} --input-sustain-ms {args.input_sustain_ms:g}")
+    print(f"  background noise above it: {noise_hit:.1%} of chunks")
+    print(f"  speech above it:           {speech_hit:.1%} of chunks "
+          f"(--hold {args.hold:g}s bridges the gaps between words)")
+    if speech_hit < 0.15:
+        print("\nwarning: very little of your speech clears the noise. Try a longer --input-sustain-ms "
+              "(typing clicks are short, speech is sustained), or use --output only.", file=sys.stderr)
     return 0
 
 
@@ -166,8 +251,15 @@ def build_parser():
     ap.add_argument("--release", type=float, default=1.0, help="seconds to fade back up (default 1.0)")
     ap.add_argument("--easing", choices=sorted(EASINGS), default="smooth",
                     help="fade curve (default smooth; linear is a straight ramp in dB)")
+    ap.add_argument("--input-sustain-ms", type=float, default=100.0,
+                    help="the input must stay above its threshold this long to count, which ignores "
+                         "short clicks like keystrokes (default 100)")
     ap.add_argument("--calibrate", type=float, metavar="SECONDS",
                     help="measure the first --input / --input-device for SECONDS, print level percentiles, exit")
+    ap.add_argument("--calibrate-guided", action="store_true",
+                    help="guided two-phase calibration (background noise, then speech) with a suggested threshold")
+    ap.add_argument("--calibrate-seconds", type=float, default=10.0, metavar="SECONDS",
+                    help="length of each --calibrate-guided phase (default 10)")
     ap.add_argument("--list", action="store_true", help="list playback/capture streams and capture devices, then exit")
     ap.add_argument("--debug", action="store_true", help="print levels and gain twice a second")
     return ap
@@ -180,6 +272,8 @@ def main():
     if args.list:
         list_streams()
         return 0
+    if args.calibrate_guided:
+        return calibrate_guided(args)
     if args.calibrate:
         return calibrate(args)
     if not args.target:
@@ -187,6 +281,7 @@ def main():
     if not (args.output or args.input or args.input_device):
         ap.error("give at least one of --output, --input, --input-device")
 
+    sustain = sustain_chunks_for(args)
     running = True
 
     def stop(*_):
@@ -237,21 +332,21 @@ def main():
         for i in inputs:
             if i["sink"] in sinks and any(matches(i, o) for o in args.output):
                 wanted[f"out:{i['index']}"] = (parec_cmd(sinks[i["sink"]] + ".monitor", i["index"]),
-                                               args.output_threshold_db)
+                                               args.output_threshold_db, 1)
         # --input taps whichever source the app is actually capturing from, and only while
         # it has a capture stream open (so we never wake a Bluetooth mic on our own).
         for app in args.input:
             for src in source_for_app(app, sources):
-                wanted[f"in:{src}"] = (parec_cmd(src), args.input_threshold_db)
+                wanted[f"in:{src}"] = (parec_cmd(src), args.input_threshold_db, sustain)
         for dev in args.input_device:
-            wanted[f"dev:{dev}"] = (parec_cmd(dev), args.input_threshold_db)
+            wanted[f"dev:{dev}"] = (parec_cmd(dev), args.input_threshold_db, sustain)
 
         for key in list(watchers):
             if key not in wanted or not watchers[key].alive():
                 watchers.pop(key).stop()
-        for key, (cmd, thr) in wanted.items():
+        for key, (cmd, thr, sustain_n) in wanted.items():
             if key not in watchers:
-                watchers[key] = Level(cmd, thr)
+                watchers[key] = Level(cmd, thr, sustain_n)
 
     ease = EASINGS[args.easing]
     ramp = None            # (start_time, duration, from_db, to_db) while fading
@@ -286,7 +381,7 @@ def main():
                     ramp = None
 
             if args.debug and now - last_debug >= 0.5:
-                levels = " ".join(f"{k}={w.db:6.1f}dB" for k, w in sorted(watchers.items())) or "(nothing to watch)"
+                levels = " ".join(f"{k}={w.db:6.1f}/{w.sustained_db:6.1f}dB" for k, w in sorted(watchers.items())) or "(nothing to watch)"
                 print(f"{levels}  active={active}  gain={gain_db:6.1f}dB  targets={sorted(targets) or 'none'}",
                       flush=True)
                 last_debug = now
