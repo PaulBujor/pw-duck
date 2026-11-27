@@ -8,12 +8,17 @@ engaged across short pauses, then the volume fades back up.
 
   pw-duck --output zoom --input zoom --target tidal-hifi
 
-Find application names with `pw-duck --list`. Run `pw-duck --help` for options.
+Settings come from ~/.config/pw-duck/config.ini (see --show-config), and any
+command-line option overrides the file. `pw-duck --calibrate-guided` measures
+your mic and saves the threshold to the config; a running pw-duck picks up
+config changes by itself. Find application names with `pw-duck --list`.
+
 Needs only Python 3.8+ and the `pactl` / `parec` tools (pipewire-pulse or pulseaudio).
 """
 import argparse
 import array
 import collections
+import configparser
 import json
 import math
 import os
@@ -29,12 +34,104 @@ CHUNK_MS = 20
 CHUNK_BYTES = RATE * 2 * CHUNK_MS // 1000  # s16le mono
 TICK = 0.05                                # control-loop period while idle, seconds
 RAMP_TICK = 0.02                           # control-loop period while fading (finer = smoother)
-SCAN_EVERY = 1.0                           # how often to re-read the stream graph
+SCAN_EVERY = 1.0                           # how often to re-read the stream graph and the config
 
 EASINGS = {
     "linear": lambda f: f,
     "smooth": lambda f: f * f * (3 - 2 * f),   # smoothstep: gentle start and end
 }
+
+CONFIG_SECTION = "pw-duck"
+# Settings that may live in the config file. `list` values are comma-separated.
+CONFIG_KEYS = {
+    "target": list, "output": list, "input": list, "input-device": list,
+    "duck-db": float, "output-threshold-db": float, "input-threshold-db": float,
+    "input-sustain-ms": float, "hold": float, "attack": float, "release": float,
+    "easing": str,
+}
+
+
+def default_config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "pw-duck", "config.ini")
+
+
+DEFAULTS = {
+    "target": [], "output": [], "input": [], "input_device": [],
+    "duck_db": -12.0, "output_threshold_db": -50.0, "input_threshold_db": -40.0,
+    "input_sustain_ms": 100.0, "hold": 1.5, "attack": 0.15, "release": 1.0, "easing": "smooth",
+    "config": default_config_path(), "calibrate": None, "calibrate_guided": False,
+    "calibrate_seconds": 10.0, "no_save": False, "save_config": False,
+    "show_config": False, "list": False, "debug": False,
+}
+
+
+class ConfigError(Exception):
+    pass
+
+
+def dest_of(key):
+    return key.replace("-", "_")
+
+
+def read_config(path):
+    """Return {dest: value} from the config file; {} if it doesn't exist."""
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        cp.read(path)
+    except configparser.Error as e:
+        raise ConfigError(f"{path}: {e}")
+    out = {}
+    if not cp.has_section(CONFIG_SECTION):
+        return out
+    for key, raw in cp[CONFIG_SECTION].items():
+        typ = CONFIG_KEYS.get(key)
+        if typ is None:
+            print(f"pw-duck: {path}: ignoring unknown setting '{key}'", file=sys.stderr, flush=True)
+            continue
+        try:
+            out[dest_of(key)] = ([x.strip() for x in raw.split(",") if x.strip()] if typ is list else typ(raw))
+        except ValueError:
+            raise ConfigError(f"{path}: bad value for '{key}': {raw!r}")
+    if out.get("easing", "smooth") not in EASINGS:
+        raise ConfigError(f"{path}: easing must be one of {sorted(EASINGS)}")
+    return out
+
+
+def save_config(path, updates):
+    """Merge {key: value} into the config file (keeps other settings), atomically."""
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.read(path)
+    if not cp.has_section(CONFIG_SECTION):
+        cp.add_section(CONFIG_SECTION)
+    for key, value in updates.items():
+        cp[CONFIG_SECTION][key] = ", ".join(value) if isinstance(value, list) else f"{value:g}" if isinstance(value, float) else str(value)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("# pw-duck settings. Written by `pw-duck --save-config` / `--calibrate-guided`; safe to edit.\n")
+        cp.write(f)
+    os.replace(tmp, path)
+
+
+def config_updates_from_cli(cli, keys=None):
+    """The config-able settings the user passed explicitly on the command line."""
+    return {k: cli[dest_of(k)] for k in CONFIG_KEYS if dest_of(k) in cli and (keys is None or k in keys)}
+
+
+def resolve(cli):
+    """Defaults < config file < command line."""
+    values = dict(DEFAULTS)
+    values.update(read_config(cli.get("config", DEFAULTS["config"])))
+    values.update(cli)
+    return argparse.Namespace(**values)
+
+
+def file_mtime(path):
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
 
 
 def pactl_json(*args):
@@ -133,14 +230,15 @@ def source_for_app(app, sources):
 
 
 def input_device(args):
-    """First capture device to measure: an --input-device, else an --input app's source."""
+    """First capture device to measure: an input device, else an input app's source."""
     sources = {s["index"]: s["name"] for s in pactl_json("list", "sources")}
     devices = list(args.input_device)
     for app in args.input:
         devices += source_for_app(app, sources)
     if not devices:
-        print("No input to measure: the --input app has no capture stream open, "
-              "or no --input-device given. See `pw-duck --list`.", file=sys.stderr)
+        print("No input to measure: set `input` in the config or pass --input APP (the app needs a "
+              "capture stream open, e.g. join the call) or --input-device. See `pw-duck --list`.",
+              file=sys.stderr)
     return devices[0] if devices else None
 
 
@@ -196,8 +294,8 @@ def cue(message, lead=3.0):
         subprocess.run(["paplay", bell], stderr=subprocess.DEVNULL)
 
 
-def calibrate_guided(args):
-    """Two measured phases (noise you want ignored, then speech) and a suggested threshold."""
+def calibrate_guided(args, cli):
+    """Two measured phases (noise you want ignored, then speech); saves the threshold to the config."""
     dev = input_device(args)
     if dev is None:
         return 1
@@ -208,9 +306,8 @@ def calibrate_guided(args):
     noise = measure(dev, secs, n)
     cue("PHASE 2: talk normally, as you would on the call")
     speech = measure(dev, secs, n)
-    notify = shutil.which("notify-send")
-    if notify:
-        subprocess.run([notify, "-t", "3000", "pw-duck calibration", "Done"], stderr=subprocess.DEVNULL)
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-t", "3000", "pw-duck calibration", "Done"], stderr=subprocess.DEVNULL)
 
     print("\nsustained level (dBFS RMS):")
     print(f"  noise:  {percentile_line([t[1] for t in noise])}")
@@ -219,69 +316,113 @@ def calibrate_guided(args):
     speech_s = [t[1] for t in speech]
     threshold = round(pick(noise_s, 0.995) + 1.5, 1)
     noise_hit, speech_hit = frac_above(noise_s, threshold), frac_above(speech_s, threshold)
-    print(f"\nsuggested: --input-threshold-db {threshold:g} --input-sustain-ms {args.input_sustain_ms:g}")
+    print(f"\nsuggested: input-threshold-db = {threshold:g}, input-sustain-ms = {args.input_sustain_ms:g}")
     print(f"  background noise above it: {noise_hit:.1%} of chunks")
     print(f"  speech above it:           {speech_hit:.1%} of chunks "
           f"(--hold {args.hold:g}s bridges the gaps between words)")
     if speech_hit < 0.15:
-        print("\nwarning: very little of your speech clears the noise. Try a longer --input-sustain-ms "
-              "(typing clicks are short, speech is sustained), or use --output only.", file=sys.stderr)
+        print("\nwarning: very little of your speech clears the noise, so nothing was saved. Try a longer "
+              "--input-sustain-ms (typing clicks are short, speech is sustained), or use --output only.",
+              file=sys.stderr)
+        return 1
+    if args.no_save:
+        print("\n--no-save given: config not changed.")
+        return 0
+    updates = {"input-threshold-db": threshold, "input-sustain-ms": args.input_sustain_ms}
+    updates.update(config_updates_from_cli(cli, keys=("input", "input-device")))
+    save_config(args.config, updates)
+    print(f"\nsaved {', '.join(updates)} to {args.config}\n"
+          "A running pw-duck reloads it within a second. Re-run this command any time to recalibrate.")
     return 0
 
 
+def show_config(args, cli):
+    file_values = read_config(args.config) if file_mtime(args.config) else {}
+    print(f"config file: {args.config}" + ("" if file_mtime(args.config) else "  (does not exist yet)"))
+    for key in CONFIG_KEYS:
+        d = dest_of(key)
+        source = "command line" if d in cli else "config file" if d in file_values else "default"
+        value = getattr(args, d)
+        print(f"  {key:<20} = {', '.join(value) if isinstance(value, list) else value}   [{source}]")
+
+
 def build_parser():
+    # argument_default=SUPPRESS: only options actually given end up in the namespace, so the
+    # command line can be layered over the config file and the defaults.
     ap = argparse.ArgumentParser(
-        prog="pw-duck", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--target", action="append", default=[], metavar="APP",
+        prog="pw-duck", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        argument_default=argparse.SUPPRESS)
+    ap.add_argument("--config", metavar="FILE", help=f"config file (default {default_config_path()})")
+    ap.add_argument("--target", action="append", metavar="APP",
                     help="app to duck (repeatable). Matches application.name or process binary")
-    ap.add_argument("--output", action="append", default=[], metavar="APP",
+    ap.add_argument("--output", action="append", metavar="APP",
                     help="duck while APP's playback is audible (repeatable)")
-    ap.add_argument("--input", action="append", default=[], metavar="APP",
+    ap.add_argument("--input", action="append", metavar="APP",
                     help="duck while the mic APP is recording from is loud (repeatable)")
-    ap.add_argument("--input-device", action="append", default=[], metavar="SOURCE",
+    ap.add_argument("--input-device", action="append", metavar="SOURCE",
                     help="duck while this capture device is loud, e.g. @DEFAULT_SOURCE@. Always opened, "
                          "which can switch a Bluetooth headset to its headset profile")
-    ap.add_argument("--duck-db", type=float, default=-12.0, help="how far to duck, in dB (default -12)")
-    ap.add_argument("--output-threshold-db", type=float, default=-50.0,
+    ap.add_argument("--duck-db", type=float, help="how far to duck, in dB (default -12)")
+    ap.add_argument("--output-threshold-db", type=float,
                     help="dBFS RMS that counts as playback sound (default -50)")
-    ap.add_argument("--input-threshold-db", type=float, default=-40.0,
-                    help="dBFS RMS that counts as you speaking (default -40; see --calibrate)")
-    ap.add_argument("--hold", type=float, default=1.5, help="seconds to stay ducked after sound stops (default 1.5)")
-    ap.add_argument("--attack", type=float, default=0.15, help="seconds to duck down (default 0.15)")
-    ap.add_argument("--release", type=float, default=1.0, help="seconds to fade back up (default 1.0)")
-    ap.add_argument("--easing", choices=sorted(EASINGS), default="smooth",
-                    help="fade curve (default smooth; linear is a straight ramp in dB)")
-    ap.add_argument("--input-sustain-ms", type=float, default=100.0,
+    ap.add_argument("--input-threshold-db", type=float,
+                    help="dBFS RMS that counts as you speaking (default -40; see --calibrate-guided)")
+    ap.add_argument("--input-sustain-ms", type=float,
                     help="the input must stay above its threshold this long to count, which ignores "
                          "short clicks like keystrokes (default 100)")
-    ap.add_argument("--calibrate", type=float, metavar="SECONDS",
-                    help="measure the first --input / --input-device for SECONDS, print level percentiles, exit")
+    ap.add_argument("--hold", type=float, help="seconds to stay ducked after sound stops (default 1.5)")
+    ap.add_argument("--attack", type=float, help="seconds to duck down (default 0.15)")
+    ap.add_argument("--release", type=float, help="seconds to fade back up (default 1.0)")
+    ap.add_argument("--easing", choices=sorted(EASINGS),
+                    help="fade curve (default smooth; linear is a straight ramp in dB)")
     ap.add_argument("--calibrate-guided", action="store_true",
-                    help="guided two-phase calibration (background noise, then speech) with a suggested threshold")
-    ap.add_argument("--calibrate-seconds", type=float, default=10.0, metavar="SECONDS",
+                    help="guided two-phase calibration (background noise, then speech); saves the "
+                         "threshold to the config")
+    ap.add_argument("--calibrate-seconds", type=float, metavar="SECONDS",
                     help="length of each --calibrate-guided phase (default 10)")
+    ap.add_argument("--no-save", action="store_true", help="with --calibrate-guided: don't write the config")
+    ap.add_argument("--calibrate", type=float, metavar="SECONDS",
+                    help="measure the input for SECONDS and print level percentiles, exit (saves nothing)")
+    ap.add_argument("--save-config", action="store_true",
+                    help="write the settings given on this command line to the config file, then exit")
+    ap.add_argument("--show-config", action="store_true",
+                    help="print the effective settings and where each comes from, then exit")
     ap.add_argument("--list", action="store_true", help="list playback/capture streams and capture devices, then exit")
-    ap.add_argument("--debug", action="store_true", help="print levels and gain twice a second")
+    ap.add_argument("--debug", action="store_true", help="print levels (instant/sustained) and gain twice a second")
     return ap
 
 
-def main():
+def main(argv=None):
     ap = build_parser()
-    args = ap.parse_args()
+    cli = vars(ap.parse_args(argv))
+    try:
+        args = resolve(cli)
+    except ConfigError as e:
+        print(f"pw-duck: {e}", file=sys.stderr)
+        return 2
 
     if args.list:
         list_streams()
         return 0
+    if args.show_config:
+        show_config(args, cli)
+        return 0
+    if args.save_config:
+        updates = config_updates_from_cli(cli)
+        if not updates:
+            ap.error("--save-config needs at least one setting on the command line")
+        save_config(args.config, updates)
+        print(f"saved {', '.join(updates)} to {args.config}")
+        return 0
     if args.calibrate_guided:
-        return calibrate_guided(args)
+        return calibrate_guided(args, cli)
     if args.calibrate:
         return calibrate(args)
     if not args.target:
-        ap.error("--target is required")
+        ap.error(f"no target: pass --target APP or set `target` in {args.config}")
     if not (args.output or args.input or args.input_device):
-        ap.error("give at least one of --output, --input, --input-device")
+        ap.error(f"nothing to watch: pass --output / --input / --input-device or set them in {args.config}")
 
-    sustain = sustain_chunks_for(args)
     running = True
 
     def stop(*_):
@@ -294,19 +435,43 @@ def main():
     watchers = {}      # key -> Level; key prefix says what it is: out: / in: / dev:
     targets = {}       # sink-input index -> raw volume at 0 dB of ducking
     gain_db = 0.0      # current ducking, 0 .. duck_db (shared by all targets)
+    ease = EASINGS[args.easing]
+    cfg_mtime = file_mtime(args.config)
 
     def raw_for(base, gain):
         # PulseAudio/PipeWire volumes are cubic: dB = 60 * log10(raw ratio).
         return max(1, round(base * 10 ** (gain / 60)))
 
-    def apply_gain():
-        # Launch all targets' updates together, then wait, so several targets fade in step.
-        procs = [subprocess.Popen(["pactl", "set-sink-input-volume", str(idx), str(raw_for(base, gain_db))],
-                                  stderr=subprocess.DEVNULL) for idx, base in targets.items()]
+    def set_volumes(items):
+        # Launch all updates together, then wait, so several targets fade in step.
+        procs = [subprocess.Popen(["pactl", "set-sink-input-volume", str(idx), str(raw)],
+                                  stderr=subprocess.DEVNULL) for idx, raw in items]
         for p in procs:
             p.wait()
 
+    def apply_gain():
+        set_volumes([(idx, raw_for(base, gain_db)) for idx, base in targets.items()])
+
+    def reload_config():
+        nonlocal args, ease, cfg_mtime
+        mtime = file_mtime(args.config)
+        if mtime == cfg_mtime:
+            return
+        cfg_mtime = mtime
+        try:
+            new = resolve(cli)
+        except ConfigError as e:
+            print(f"pw-duck: ignoring config change: {e}", file=sys.stderr, flush=True)
+            return
+        args = new
+        ease = EASINGS[args.easing]
+        for w in watchers.values():          # thresholds are baked into watchers; scan() recreates them
+            w.stop()
+        watchers.clear()
+        print("pw-duck: config reloaded", file=sys.stderr, flush=True)
+
     def scan():
+        reload_config()
         inputs = pactl_json("list", "sink-inputs")
         sinks = {s["index"]: s["name"] for s in pactl_json("list", "sinks")}
         sources = {s["index"]: s["name"] for s in pactl_json("list", "sources")}
@@ -324,8 +489,11 @@ def main():
                     apply_gain()
             elif abs(cur - raw_for(targets[idx], gain_db)) > 0.02 * 65536:
                 targets[idx] = cur / 10 ** (gain_db / 60)   # user moved the slider: adopt it
+        existing = {i["index"] for i in inputs}
         for idx in list(targets):
             if idx not in seen:
+                if idx in existing and gain_db < 0:       # no longer a target (config change): un-duck it
+                    set_volumes([(idx, round(targets[idx]))])
                 del targets[idx]
 
         wanted = {}
@@ -333,13 +501,13 @@ def main():
             if i["sink"] in sinks and any(matches(i, o) for o in args.output):
                 wanted[f"out:{i['index']}"] = (parec_cmd(sinks[i["sink"]] + ".monitor", i["index"]),
                                                args.output_threshold_db, 1)
-        # --input taps whichever source the app is actually capturing from, and only while
+        # An input app is tapped at whichever source it is actually capturing from, and only while
         # it has a capture stream open (so we never wake a Bluetooth mic on our own).
         for app in args.input:
             for src in source_for_app(app, sources):
-                wanted[f"in:{src}"] = (parec_cmd(src), args.input_threshold_db, sustain)
+                wanted[f"in:{src}"] = (parec_cmd(src), args.input_threshold_db, sustain_chunks_for(args))
         for dev in args.input_device:
-            wanted[f"dev:{dev}"] = (parec_cmd(dev), args.input_threshold_db, sustain)
+            wanted[f"dev:{dev}"] = (parec_cmd(dev), args.input_threshold_db, sustain_chunks_for(args))
 
         for key in list(watchers):
             if key not in wanted or not watchers[key].alive():
@@ -348,7 +516,6 @@ def main():
             if key not in watchers:
                 watchers[key] = Level(cmd, thr, sustain_n)
 
-    ease = EASINGS[args.easing]
     ramp = None            # (start_time, duration, from_db, to_db) while fading
     ramp_goal = 0.0        # the goal the current ramp (or rest state) is heading to
     last_scan = last_debug = 0.0
@@ -359,7 +526,7 @@ def main():
                 try:
                     scan()
                 except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as e:
-                    print(f"pw-duck: scan failed ({e!r}); retrying", file=sys.stderr)
+                    print(f"pw-duck: scan failed ({e!r}); retrying", file=sys.stderr, flush=True)
                 last_scan = now
 
             active = any(now - w.last_active < args.hold for w in watchers.values())
@@ -381,7 +548,8 @@ def main():
                     ramp = None
 
             if args.debug and now - last_debug >= 0.5:
-                levels = " ".join(f"{k}={w.db:6.1f}/{w.sustained_db:6.1f}dB" for k, w in sorted(watchers.items())) or "(nothing to watch)"
+                levels = " ".join(f"{k}={w.db:6.1f}/{w.sustained_db:6.1f}dB" for k, w in sorted(watchers.items())) \
+                    or "(nothing to watch)"
                 print(f"{levels}  active={active}  gain={gain_db:6.1f}dB  targets={sorted(targets) or 'none'}",
                       flush=True)
                 last_debug = now

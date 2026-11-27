@@ -66,7 +66,31 @@ pw-duck --output discord --target spotify --target firefox --duck-db -18 --relea
 pw-duck --input-device @DEFAULT_SOURCE@ --target spotify
 ```
 
+### Config file
+
+Settings live in `~/.config/pw-duck/config.ini` (or `$XDG_CONFIG_HOME/pw-duck/config.ini`, or `--config FILE`). Command-line options override it, and it overrides the built-in defaults. A running `pw-duck` notices when the file changes and reloads it within a second, so there is nothing to restart.
+
+```ini
+[pw-duck]
+target = tidal-hifi
+output = zoom
+input = zoom
+input-threshold-db = -41.8
+```
+
+Keys are the long option names without `--`; list options (`target`, `output`, `input`, `input-device`) are comma-separated. A list given on the command line replaces the file's list, it doesn't add to it. A file with a typo is ignored with a message in the log, and the previous settings stay in effect.
+
+```sh
+# write the settings you pass on the command line into the config, then exit
+pw-duck --target tidal-hifi --output zoom --input zoom --save-config
+
+# see the effective settings and where each one comes from
+pw-duck --show-config
+```
+
 ### Options
+
+Every option except the `--calibrate*`, `--save-config`, `--show-config`, `--list`, `--debug` and `--config` ones can also be set in the config file.
 
 | Option | Default | |
 |---|---|---|
@@ -78,10 +102,14 @@ pw-duck --input-device @DEFAULT_SOURCE@ --target spotify
 | `--output-threshold-db` | `-50` | Level (dBFS RMS) that counts as playback sound. |
 | `--input-threshold-db` | `-40` | Level (dBFS RMS) that counts as you speaking. |
 | `--input-sustain-ms` | `100` | The input must stay above its threshold this long to count. Ignores keystroke clicks. |
-| `--calibrate-guided` | | Guided two-phase calibration (noise, then speech) with suggested settings. |
+| `--calibrate-guided` | | Guided two-phase calibration (noise, then speech). Saves the threshold to the config. |
 | `--calibrate-seconds` | `10` | Length of each guided phase. |
-| `--calibrate SECONDS` | | Measure the first `--input` / `--input-device`, print percentiles, exit. |
-| `--debug` | | Print levels and gain twice a second. |
+| `--no-save` | | With `--calibrate-guided`: show the result but leave the config alone. |
+| `--calibrate SECONDS` | | Measure the first input, print percentiles, exit. Saves nothing. |
+| `--save-config` | | Write the settings given on the command line to the config, then exit. |
+| `--show-config` | | Print the effective settings and their sources, then exit. |
+| `--config FILE` | | Use a different config file. |
+| `--debug` | | Print levels (`instant/sustained`) and gain twice a second. |
 
 ## Calibrating the mic threshold
 
@@ -91,19 +119,25 @@ Playback from an app is usually digital silence between sounds, so the `-50` dB 
 pw-duck --input zoom --calibrate-guided
 ```
 
-It runs two phases of 10 seconds (`--calibrate-seconds`), announced by a notification and a sound: first your normal background noise (type, but don't talk), then talking. It prints the level percentiles of each phase and suggests settings:
+If `input` is already in your config you can leave `--input zoom` off. It runs two phases of 10 seconds (`--calibrate-seconds`), announced by a notification and a sound: first your normal background noise (type, but don't talk), then talking. It prints the level percentiles of each phase, suggests settings, and **saves them to the config file**:
 
 ```
 sustained level (dBFS RMS):
   noise:  p5= -63.2  p25= -54.1  p50= -51.7  p75= -48.3  p90= -46.6  p99= -44.3  max= -43.0
   speech: p5= -62.3  p25= -54.9  p50= -47.5  p75= -42.4  p90= -38.0  p99= -34.4  max= -31.8
 
-suggested: --input-threshold-db -41.8 --input-sustain-ms 100
+suggested: input-threshold-db = -41.8, input-sustain-ms = 100
   background noise above it: 0.0% of chunks
   speech above it:           23.2% of chunks (--hold 1.5s bridges the gaps between words)
+
+saved input-threshold-db, input-sustain-ms to ~/.config/pw-duck/config.ini
 ```
 
-The "speech above it" figure is per 20 ms chunk. Speech is full of short gaps, and `--hold` keeps the duck engaged across them, so it doesn't need to be near 100%. The tool warns if almost none of your speech clears the noise.
+It saves `input-threshold-db` and `input-sustain-ms`, plus `input` / `input-device` if you passed them on that command line. It never touches your other settings. If you used `--no-save`, nothing is written.
+
+Calibration is meant to be redone whenever the room changes (a new desk, a different mic, a noisy day). Just run the command again, even while the service is running: the running `pw-duck` picks up the new values by itself.
+
+The "speech above it" figure is per 20 ms chunk. Speech is full of short gaps, and `--hold` keeps the duck engaged across them, so it doesn't need to be near 100%. If almost none of your speech clears the noise, the tool warns and saves nothing.
 
 For a quick single measurement, `--calibrate SECONDS` prints both the instantaneous and the sustained percentiles. Use `--debug` to watch live levels (`instant/sustained`) while you tune.
 
@@ -126,11 +160,13 @@ A systemd user unit is in [`contrib/pw-duck.service`](contrib/pw-duck.service):
 ```sh
 mkdir -p ~/.config/systemd/user
 cp contrib/pw-duck.service ~/.config/systemd/user/
-$EDITOR ~/.config/systemd/user/pw-duck.service   # set your ExecStart arguments
+pw-duck --target tidal-hifi --output zoom --input zoom --save-config   # settings go in the config
 systemctl --user daemon-reload
 systemctl --user enable --now pw-duck
 journalctl --user -u pw-duck -f
 ```
+
+The unit runs `pw-duck` with no arguments, so everything comes from the config file, and editing or recalibrating takes effect without a restart. `journalctl` shows `config reloaded` each time.
 
 ## Caveats
 

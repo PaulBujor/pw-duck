@@ -4,8 +4,9 @@ After=pipewire-pulse.service
 Wants=pipewire-pulse.service
 
 [Service]
-# Edit the arguments to taste. See `pw-duck --help`.
-ExecStart=%h/.local/bin/pw-duck --output zoom --input zoom --target tidal-hifi
+# Settings come from ~/.config/pw-duck/config.ini and are reloaded when that file changes.
+# Add command-line options here only to override the file.
+ExecStart=%h/.local/bin/pw-duck
 Restart=on-failure
 RestartSec=3
 
